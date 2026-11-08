@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="id"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GPS Motor Tracker</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<style>
+body{margin:0;font-family:Arial,sans-serif;background:#edf2f7;color:#14213d}
+.top{background:#14213d;color:#fff;padding:10px;text-align:center}
+#speed{font-size:56px;font-weight:bold;line-height:1}
+#status{font-size:12px;color:#93c5fd}
+.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;padding:8px}
+.c{background:#fff;padding:8px;border-radius:6px;font-size:11px;color:#64748b}
+.c b{display:block;font-size:16px;color:#14213d}
+#map{height:38vh}
+.btns{display:flex;gap:6px;padding:8px}
+button{flex:1;padding:12px 4px;border:0;border-radius:6px;color:#fff;font-weight:bold}
+select{padding:8px}
+table{width:100%;font-size:12px;border-collapse:collapse;background:#fff}
+td,th{padding:4px;border-bottom:1px solid #e2e8f0;text-align:center}
+</style></head><body>
+<div class="top"><div id="status">● Belum dimulai</div><div id="speed">0</div>KM/JAM</div>
+<div class="grid">
+ <div class="c">JARAK<b id="dist">0.00 km</b></div>
+ <div class="c">DURASI<b id="time">00:00:00</b></div>
+ <div class="c">RATA-RATA<b id="avg">0.0</b></div>
+ <div class="c">MAKS<b id="max">0.0</b></div>
+ <div class="c">CHECKPOINT<b id="cp">0</b></div>
+ <div class="c">AKURASI<b id="acc">-</b></div>
+</div>
+<div id="map"></div>
+<div class="btns">
+ <button id="go" style="background:#16834a">▶ MULAI</button>
+ <button id="pause" style="background:#64748b">Ⅱ JEDA</button>
+ <button id="reset" style="background:#dc2626">↻ RESET</button>
+ <button id="csv" style="background:#2563eb">CSV</button>
+</div>
+<div class="btns" style="align-items:center">Checkpoint tiap
+ <select id="iv"><option value="1">1 km</option><option value="2">2 km</option></select></div>
+<table><thead><tr><th>Titik</th><th>Jarak</th><th>Kecepatan</th><th>Koordinat</th><th>Waktu</th></tr></thead>
+<tbody id="rows"></tbody></table>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+const map = L.map('map').setView([1.4748, 124.8421], 13);
+L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+  {maxZoom: 19, attribution: '© OpenStreetMap'}).addTo(map);
+const line = L.polyline([], {color: '#2563eb', weight: 5}).addTo(map);
+let marker = null, watchId = null, timer = null, wake = null;
+let running = false, last = null, dist = 0, secs = 0, speed = 0, maxSp = 0, cp = 0, rows = [];
+
+function hav(a, b) {
+  const R = 6371000, r = Math.PI / 180;
+  const dl = (b[0] - a[0]) * r, dn = (b[1] - a[1]) * r;
+  const x = Math.sin(dl / 2) ** 2 + Math.cos(a[0] * r) * Math.cos(b[0] * r) * Math.sin(dn / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(x), Math.sqrt(1 - x));
+}
+const pad = n => String(n).padStart(2, '0');
+
+function show() {
+  $('speed').textContent = Math.round(speed);
+  $('dist').textContent = (dist / 1000).toFixed(2) + ' km';
+  $('time').textContent = `${pad(secs / 3600 | 0)}:${pad(secs % 3600 / 60 | 0)}:${pad(secs % 60)}`;
+  $('avg').textContent = (secs ? dist / secs * 3.6 : 0).toFixed(1);
+  $('max').textContent = maxSp.toFixed(1);
+  $('cp').textContent = cp;
+}
+
+function addRow(name, pt) {
+  const t = new Date().toLocaleTimeString('id-ID');
+  rows.push([name, (dist / 1000).toFixed(3), speed.toFixed(1), pt[0].toFixed(6), pt[1].toFixed(6), t]);
+  const tr = document.createElement('tr');
+  tr.innerHTML = `<td>${name}</td><td>${(dist / 1000).toFixed(2)}</td><td>${speed.toFixed(1)}</td>` +
+    `<td>${pt[0].toFixed(4)}, ${pt[1].toFixed(4)}</td><td>${t}</td>`;
+  $('rows').prepend(tr);
+}
+
+function onPos(p) {
+  const c = p.coords, pt = [c.latitude, c.longitude];
+  $('acc').textContent = Math.round(c.accuracy) + ' m';
+  if (c.accuracy > 30) return;                       // sinyal buruk diabaikan
+  if (!marker) marker = L.circleMarker(pt, {radius: 8, color: '#fff', fillColor: '#0f172a', fillOpacity: 1}).addTo(map);
+  else marker.setLatLng(pt);
+  map.panTo(pt);
+
+  if (!last) { last = {pt, t: p.timestamp}; line.addLatLng(pt); addRow('START', pt); show(); return; }
+
+  const d = hav(last.pt, pt), dt = (p.timestamp - last.t) / 1000;
+  if (d < 3 || dt <= 0) { speed = 0; show(); return; }  // diam / GPS bergoyang
+  dist += d;
+  speed = (c.speed != null && !isNaN(c.speed) ? c.speed : d / dt) * 3.6;
+  maxSp = Math.max(maxSp, speed);
+  last = {pt, t: p.timestamp};
+  line.addLatLng(pt);
+
+  const iv = +$('iv').value * 1000;
+  while (dist >= (cp + 1) * iv) { cp++; addRow('Checkpoint ' + cp, pt); }
+  show();
+}
+
+async function start() {
+  if (running) return;
+  if (!navigator.geolocation) return alert('Browser tidak mendukung GPS.');
+  running = true;
+  $('status').textContent = '● Tracking berjalan';
+  watchId = navigator.geolocation.watchPosition(onPos,
+    e => alert('GPS error: ' + e.message + '\nPastikan izin lokasi diaktifkan dan memakai HTTPS.'),
+    {enableHighAccuracy: true, maximumAge: 0, timeout: 15000});
+  timer = setInterval(() => { secs++; show(); }, 1000);
+  try { wake = await navigator.wakeLock.request('screen'); } catch (e) {}  // layar tetap menyala
+}
+
+function pause() {
+  if (!running) return;
+  running = false; last = null; speed = 0;               // last=null agar tidak lompat saat lanjut
+  navigator.geolocation.clearWatch(watchId);
+  clearInterval(timer);
+  if (wake) wake.release();
+  $('status').textContent = '● Dijeda';
+  show();
+}
+
+function reset() {
+  pause();
+  dist = secs = speed = maxSp = cp = 0; rows = [];
+  line.setLatLngs([]); $('rows').innerHTML = '';
+  $('status').textContent = '● Belum dimulai';
+  show();
+}
+
+function csv() {
+  if (!rows.length) return alert('Belum ada data.');
+  const head = 'Titik,Jarak (km),Kecepatan (km/jam),Latitude,Longitude,Waktu\n';
+  const blob = new Blob(['\ufeff' + head + rows.map(r => r.join(',')).join('\n')], {type: 'text/csv'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob); a.download = 'riwayat_gps_motor.csv'; a.click();
+}
+
+$('go').onclick = start; $('pause').onclick = pause;
+$('reset').onclick = reset; $('csv').onclick = csv;
+</script></body></html>
