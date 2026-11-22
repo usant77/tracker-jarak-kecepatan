@@ -17,6 +17,12 @@ button{flex:1;padding:12px 4px;border:0;border-radius:6px;color:#fff;font-weight
 select{padding:8px}
 table{width:100%;font-size:12px;border-collapse:collapse;background:#fff}
 td,th{padding:4px;border-bottom:1px solid #e2e8f0;text-align:center}
+.tabs{display:flex;gap:4px;padding:0 8px}
+.tabs button{background:#cbd5e1;color:#14213d;border-radius:6px 6px 0 0;padding:8px}
+.tabs button.on{background:#fff}
+.pane{display:none}.pane.on{display:block}
+#chart{width:100%;height:130px;background:#fff;display:block}
+h4{margin:8px;font-size:13px}
 </style></head><body>
 <div class="top"><div id="status">● Belum dimulai</div><div id="speed">0</div>KM/JAM</div>
 <div class="grid">
@@ -30,14 +36,32 @@ td,th{padding:4px;border-bottom:1px solid #e2e8f0;text-align:center}
 <div id="map"></div>
 <div class="btns">
  <button id="go" style="background:#16834a">▶ MULAI</button>
- <button id="pause" style="background:#64748b">Ⅱ JEDA</button>
  <button id="reset" style="background:#dc2626">↻ RESET</button>
  <button id="csv" style="background:#2563eb">CSV</button>
 </div>
-<div class="btns" style="align-items:center">Checkpoint tiap
- <select id="iv"><option value="1">1 km</option><option value="2">2 km</option></select></div>
+<div class="btns" style="align-items:center;flex-wrap:wrap">Checkpoint tiap
+ <select id="iv"><option value="500">500 m</option><option value="1000" selected>1 km</option><option value="2000">2 km</option></select>
+ <label><input type="checkbox" id="voice" checked> 🔊 Baca jarak tiap 100 m</label></div>
+
+<div class="tabs"><button class="on" data-p="p1">Checkpoint</button><button data-p="p2">Statistik</button></div>
+<div class="pane on" id="p1">
 <table><thead><tr><th>Titik</th><th>Jarak</th><th>Kecepatan</th><th>Koordinat</th><th>Waktu</th></tr></thead>
-<tbody id="rows"></tbody></table>
+<tbody id="rows"></tbody></table></div>
+
+<div class="pane" id="p2">
+ <div class="grid">
+  <div class="c">WAKTU BERGERAK<b id="sMove">00:00:00</b></div>
+  <div class="c">WAKTU DIAM<b id="sIdle">00:00:00</b></div>
+  <div class="c">RATA² BERGERAK<b id="sAvgM">0.0</b></div>
+  <div class="c">PACE<b id="sPace">-</b></div>
+  <div class="c">KECEPATAN MAKS<b id="sMax">0.0</b></div>
+  <div class="c">TERCEPAT/KM<b id="sBest">-</b></div>
+ </div>
+ <h4>Grafik kecepatan (km/jam)</h4>
+ <canvas id="chart"></canvas>
+ <h4>Split per checkpoint</h4>
+ <table><thead><tr><th>Split</th><th>Waktu</th><th>Rata-rata</th></tr></thead><tbody id="splits"></tbody></table>
+</div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
 <script>
@@ -46,8 +70,9 @@ const map = L.map('map').setView([1.4748, 124.8421], 13);
 L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',
   {maxZoom: 19, attribution: '© OpenStreetMap'}).addTo(map);
 const line = L.polyline([], {color: '#2563eb', weight: 5}).addTo(map);
-let marker = null, watchId = null, timer = null, wake = null;
+let marker = null, watchId = null, timer = null, wake = null, cpMarkers = [];
 let running = false, last = null, dist = 0, secs = 0, speed = 0, maxSp = 0, cp = 0, rows = [];
+let moveSecs = 0, nextVoice = 100, lastCpSecs = 0, lastCpDist = 0, samples = [], splits = [];
 
 function hav(a, b) {
   const R = 6371000, r = Math.PI / 180;
@@ -56,14 +81,54 @@ function hav(a, b) {
   return R * 2 * Math.atan2(Math.sqrt(x), Math.sqrt(1 - x));
 }
 const pad = n => String(n).padStart(2, '0');
+const fmt = s => `${pad(s / 3600 | 0)}:${pad(s % 3600 / 60 | 0)}:${pad(s % 60)}`;
+
+// ===== Baca jarak (suara) =====
+function speak(txt) {
+  if (!$('voice').checked || !('speechSynthesis' in window)) return;
+  const u = new SpeechSynthesisUtterance(txt); u.lang = 'id-ID';
+  speechSynthesis.cancel(); speechSynthesis.speak(u);
+}
+function sayDist(m) {
+  const km = Math.floor(m / 1000), mm = m % 1000;
+  speak(km === 0 ? mm + ' meter' : mm === 0 ? km + ' kilometer' : km + ' kilometer ' + mm + ' meter');
+}
 
 function show() {
+  const km = dist / 1000;
   $('speed').textContent = Math.round(speed);
-  $('dist').textContent = (dist / 1000).toFixed(2) + ' km';
-  $('time').textContent = `${pad(secs / 3600 | 0)}:${pad(secs % 3600 / 60 | 0)}:${pad(secs % 60)}`;
+  $('dist').textContent = km.toFixed(2) + ' km';
+  $('time').textContent = fmt(secs);
   $('avg').textContent = (secs ? dist / secs * 3.6 : 0).toFixed(1);
   $('max').textContent = maxSp.toFixed(1);
   $('cp').textContent = cp;
+  // statistik
+  $('sMove').textContent = fmt(moveSecs);
+  $('sIdle').textContent = fmt(Math.max(0, secs - moveSecs));
+  $('sAvgM').textContent = (moveSecs ? dist / moveSecs * 3.6 : 0).toFixed(1);
+  $('sPace').textContent = km > 0.05 ? fmt(secs / km).slice(3) + ' /km' : '-';
+  $('sMax').textContent = maxSp.toFixed(1);
+  const best = splits.length ? Math.max(...splits.map(s => s.avg)) : 0;
+  $('sBest').textContent = best ? best.toFixed(1) + ' km/j' : '-';
+  drawChart();
+}
+
+function drawChart() {
+  const cv = $('chart'), w = cv.width = cv.clientWidth * 2, h = cv.height = cv.clientHeight * 2, g = cv.getContext('2d');
+  g.clearRect(0, 0, w, h);
+  if (samples.length < 2) return;
+  const mx = Math.max(20, maxSp), n = samples.length - 1;
+  g.strokeStyle = '#e2e8f0'; g.fillStyle = '#64748b'; g.font = '20px Arial'; g.lineWidth = 1;
+  for (let i = 0; i <= 4; i++) {
+    const y = h - 14 - (h - 28) * i / 4;
+    g.beginPath(); g.moveTo(40, y); g.lineTo(w, y); g.stroke(); g.fillText(Math.round(mx * i / 4), 4, y + 6);
+  }
+  g.strokeStyle = '#2563eb'; g.lineWidth = 3; g.beginPath();
+  samples.forEach((v, i) => {
+    const x = 40 + (w - 48) * i / n, y = h - 14 - (h - 28) * v / mx;
+    i ? g.lineTo(x, y) : g.moveTo(x, y);
+  });
+  g.stroke();
 }
 
 function addRow(name, pt) {
@@ -73,6 +138,19 @@ function addRow(name, pt) {
   tr.innerHTML = `<td>${name}</td><td>${(dist / 1000).toFixed(2)}</td><td>${speed.toFixed(1)}</td>` +
     `<td>${pt[0].toFixed(4)}, ${pt[1].toFixed(4)}</td><td>${t}</td>`;
   $('rows').prepend(tr);
+}
+
+function addCheckpoint(pt, atDist) {
+  cp++;
+  addRow('Checkpoint ' + cp, pt);
+  cpMarkers.push(L.marker(pt).addTo(map).bindPopup('CP ' + cp + ' — ' + (atDist / 1000).toFixed(2) + ' km'));
+  const dt = secs - lastCpSecs, dd = atDist - lastCpDist, avg = dt > 0 ? dd / dt * 3.6 : 0;
+  splits.push({t: dt, avg});
+  const tr = document.createElement('tr');
+  tr.innerHTML = `<td>#${cp}</td><td>${fmt(dt)}</td><td>${avg.toFixed(1)} km/j</td>`;
+  $('splits').prepend(tr);
+  lastCpSecs = secs; lastCpDist = atDist;
+  speak('Checkpoint ' + cp);
 }
 
 function onPos(p) {
@@ -93,8 +171,12 @@ function onPos(p) {
   last = {pt, t: p.timestamp};
   line.addLatLng(pt);
 
-  const iv = +$('iv').value * 1000;
-  while (dist >= (cp + 1) * iv) { cp++; addRow('Checkpoint ' + cp, pt); }
+  // baca jarak tiap 100 m
+  while (dist >= nextVoice) { sayDist(nextVoice); nextVoice += 100; }
+
+  // catat lokasi checkpoint tiap interval (default 1 km)
+  const iv = +$('iv').value;
+  while (dist >= (cp + 1) * iv) addCheckpoint(pt, (cp + 1) * iv);
   show();
 }
 
@@ -103,27 +185,38 @@ async function start() {
   if (!navigator.geolocation) return alert('Browser tidak mendukung GPS.');
   running = true;
   $('status').textContent = '● Tracking berjalan';
+  $('go').textContent = '■ SELESAI'; $('go').style.background = '#b45309';
+  speak('Perjalanan dimulai');
   watchId = navigator.geolocation.watchPosition(onPos,
     e => alert('GPS error: ' + e.message + '\nPastikan izin lokasi diaktifkan dan memakai HTTPS.'),
     {enableHighAccuracy: true, maximumAge: 0, timeout: 15000});
-  timer = setInterval(() => { secs++; show(); }, 1000);
+  timer = setInterval(() => {
+    secs++;
+    if (speed > 2) moveSecs++;
+    if (secs % 3 === 0) samples.push(speed);        // data grafik tiap 3 detik
+    show();
+  }, 1000);
   try { wake = await navigator.wakeLock.request('screen'); } catch (e) {}  // layar tetap menyala
 }
 
-function pause() {
+function stop() {
   if (!running) return;
-  running = false; last = null; speed = 0;               // last=null agar tidak lompat saat lanjut
+  running = false; last = null; speed = 0;
   navigator.geolocation.clearWatch(watchId);
   clearInterval(timer);
   if (wake) wake.release();
-  $('status').textContent = '● Dijeda';
+  $('status').textContent = '● Selesai';
+  $('go').textContent = '▶ MULAI'; $('go').style.background = '#16834a';
+  speak('Selesai. Total jarak ' + (dist / 1000).toFixed(2) + ' kilometer');
   show();
 }
 
 function reset() {
-  pause();
-  dist = secs = speed = maxSp = cp = 0; rows = [];
-  line.setLatLngs([]); $('rows').innerHTML = '';
+  stop();
+  dist = secs = speed = maxSp = cp = moveSecs = lastCpSecs = lastCpDist = 0;
+  nextVoice = 100; rows = []; samples = []; splits = [];
+  line.setLatLngs([]); cpMarkers.forEach(m => map.removeLayer(m)); cpMarkers = [];
+  $('rows').innerHTML = ''; $('splits').innerHTML = '';
   $('status').textContent = '● Belum dimulai';
   show();
 }
@@ -136,6 +229,11 @@ function csv() {
   a.href = URL.createObjectURL(blob); a.download = 'riwayat_gps_motor.csv'; a.click();
 }
 
-$('go').onclick = start; $('pause').onclick = pause;
+$('iv').onchange = () => { cp = Math.floor(dist / +$('iv').value); show(); };
+$('go').onclick = () => running ? stop() : start();
 $('reset').onclick = reset; $('csv').onclick = csv;
+document.querySelectorAll('.tabs button').forEach(b => b.onclick = () => {
+  document.querySelectorAll('.tabs button,.pane').forEach(x => x.classList.remove('on'));
+  b.classList.add('on'); $(b.dataset.p).classList.add('on'); drawChart();
+});
 </script></body></html>
